@@ -1,215 +1,369 @@
-# Célula 2 — busca e mostra os preços
+"""
+Rastreador MacBook AU — app Streamlit
+======================================
 
-import requests
-import re
-import json
-from bs4 import BeautifulSoup
+Site local para registrar e comparar preços de MacBook em lojas da Austrália.
+O histórico é salvo em um arquivo CSV (macbook_prices.csv), criado
+automaticamente na mesma pasta deste script — armazenamento local, sem
+depender de Google Colab, Drive ou qualquer serviço externo.
 
-# ---------------------------------------------------------------
-# 👉 COLE AQUI OS LINKS DO PRODUTO (um para cada loja)
-# Copie o link direto da página do produto (não da busca) em cada site.
-# ---------------------------------------------------------------
-LINK_AMAZON = "https://www.amazon.com.au/Apple-MacBook-13-inch-6%E2%80%91core-Unified/dp/B0GR6V43V4/ref=asc_df_B0GR79XJNM?mcid=85ac20a1991b313ba5a53df41dae4e4e&tag=googleshopdsk-22&linkCode=df0&hvadid=712244421528&hvpos=&hvnetw=g&hvrand=11201868277863062815&hvpone=&hvptwo=&hvqmt=&hvdev=c&hvdvcmdl=&hvlocint=&hvlocphy=9068984&hvtargid=pla-2470778764734&hvocijid=11201868277863062815-B0GR79XJNM-&hvexpln=0&gad_source=1&th=1$0"
-LINK_JBHIFI = "https://www.jbhifi.com.au/products/apple-macbook-neo-13-inch-with-a18-pro-chip-256gb-8gb-blush?store=211&gad_source=1&gad_campaignid=17413981572&gbraid=0AAAAAD23EqqlJzfcWa4-B46SB9tgpow8v&gclid=CjwKCAjwqonVBhA4EiwA9wYJ3Ra_EC0KihWh9ZEHFYsDCl4-_D6o2e6V4E9KLpliv3EIEuIyOyuAAhoCxtYQAvD_BwE$0"
-LINK_OFFICEWORKS = "https://www.officeworks.com.au/shop/officeworks/p/macbook-neo-13-a18-pro-6-core-cpu-5-core-gpu-8-256gb-blush-mbn8pt82bh?cm_mmc=Google:SEM:Always_on:OW%7CAU+%7CTechnology%7CApple_Supplier%7CNA%7CSEM%7CGoogle%7CPMax%7CNA-OFFTHE270725&s_kwcid=AL!12073!3!!!!x!!&gclsrc=aw.ds&gad_source=1&gad_campaignid=19856019508&gbraid=0AAAAAD1FgQYVyizIGyuc2o_iu-tm03Nfp&gclid=CjwKCAjwqonVBhA4EiwA9wYJ3am-6cUhNVDw5OyOdpV6W7P48bZx_TyfZTDgohorHMnLVEh4vfPqnBoCFFQQAvD_BwE$0"
+Como rodar:
+    pip install streamlit pandas plotly
+    streamlit run app.py
 
+O navegador abre sozinho em http://localhost:8501
+"""
 
-# ---------------------------------------------------------------
-# Cabeçalhos (headers) — fazem o robô se parecer mais com um navegador
-# comum (Chrome no Windows), o que reduz a chance de bloqueio simples.
-# A Amazon costuma checar mais detalhes, então ela recebe um conjunto
-# mais completo de cabeçalhos do que as outras lojas.
-# ---------------------------------------------------------------
-HEADERS_PADRAO = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-}
+import uuid
+from datetime import date, datetime
+from pathlib import Path
 
-HEADERS_AMAZON = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-AU,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    # Fingir que viemos de uma busca no Google também ajuda em alguns casos
-    "Referer": "https://www.google.com/",
-}
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
+# ----------------------------------------------------------------------------
+# Configuração e "banco de dados" local (CSV)
+# ----------------------------------------------------------------------------
 
-# =================================================================
-# Funções auxiliares para encontrar preço sem depender de um
-# seletor CSS fixo (que quebra fácil quando o site muda o layout)
-# =================================================================
+DATA_FILE = Path(__file__).parent / "macbook_prices.csv"
 
-def _procurar_preco_recursivo(dado, chaves):
-    """
-    Percorre um dicionário/lista aninhado (típico de JSON-LD ou do
-    'estado' que sites em React/Next.js/Nuxt guardam numa tag <script>)
-    procurando por uma chave que pareça ser o preço.
-    """
-    if isinstance(dado, dict):
-        for chave, valor in dado.items():
-            if chave in chaves and isinstance(valor, (str, int, float)):
-                return str(valor)
-            resultado = _procurar_preco_recursivo(valor, chaves)
-            if resultado:
-                return resultado
-    elif isinstance(dado, list):
-        for item in dado:
-            resultado = _procurar_preco_recursivo(item, chaves)
-            if resultado:
-                return resultado
-    return None
+COLUMNS = [
+    "id", "model", "retailer", "retailer_url", "price_aud",
+    "condition", "in_stock", "logged_at", "note", "created_at",
+]
+
+COMMON_RETAILERS = [
+    "Apple Store", "JB Hi-Fi", "Officeworks", "Harvey Norman",
+    "The Good Guys", "Amazon AU", "Kogan", "Catch", "eBay AU",
+]
+
+COMMON_MODELS = [
+    'MacBook Air 13" M3 (8GB/256GB)',
+    'MacBook Air 13" M3 (16GB/256GB)',
+    'MacBook Air 15" M3 (8GB/256GB)',
+    'MacBook Air 13" M4 (16GB/256GB)',
+    'MacBook Air 15" M4 (16GB/256GB)',
+    'MacBook Pro 14" M4 (16GB/512GB)',
+    'MacBook Pro 14" M4 Pro (24GB/512GB)',
+]
+
+SEED_MODEL = 'Exemplo — MacBook Air 13" M3 (8GB/256GB)'
+
+# Paleta (validada para leitura por daltônicos — ver skill de dataviz)
+ACCENT = "#2a78d6"       # azul — linha/série principal
+ACCENT_2 = "#eb6834"     # laranja
+GOOD = "#0ca30c"
+CRITICAL = "#d03b3b"
+LINE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#e34948"]
 
 
-def extrair_de_json_ld(soup):
-    """
-    Método 1 (mais confiável): procura preço dentro de blocos JSON-LD
-    (<script type="application/ld+json">). Muitos e-commerces colocam
-    esse bloco pronto no HTML para aparecer no Google Shopping —
-    ou seja, não depende de JavaScript ser executado.
-    """
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            dados = json.loads(script.string)
-        except (TypeError, ValueError):
-            continue
-        candidatos = dados if isinstance(dados, list) else [dados]
-        for item in candidatos:
-            preco = _procurar_preco_recursivo(item, chaves=("price", "lowPrice", "highPrice"))
-            if preco:
-                return preco
-    return None
-
-
-def extrair_de_estado_embutido(html):
-    """
-    Método 2: sites em React/Next.js/Nuxt costumam colocar os dados da
-    página (incluindo o preço) dentro de uma tag <script> só com JSON
-    puro (ex.: __NEXT_DATA__, __INITIAL_STATE__, __NUXT__). Isso também
-    já vem pronto na resposta do requests — só precisa ser localizado
-    com regex e depois lido com json.loads.
-    """
-    padroes = [
-        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-        r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
-        r'window\.__NUXT__\s*=\s*(\{.*?\});',
+def _seed_dataframe() -> pd.DataFrame:
+    """Algumas linhas de exemplo, claramente marcadas, para a tela não
+    aparecer vazia na primeira execução."""
+    today = date.today()
+    rows = [
+        {
+            "id": str(uuid.uuid4()), "model": SEED_MODEL, "retailer": "Apple Store",
+            "retailer_url": "https://www.apple.com/au/shop/buy-mac/macbook-air",
+            "price_aud": 1899, "condition": "novo", "in_stock": True,
+            "logged_at": today - pd.Timedelta(days=18), "note": "preço oficial (exemplo)",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        {
+            "id": str(uuid.uuid4()), "model": SEED_MODEL, "retailer": "JB Hi-Fi",
+            "retailer_url": "", "price_aud": 1799, "condition": "novo", "in_stock": True,
+            "logged_at": today - pd.Timedelta(days=10), "note": "exemplo",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        {
+            "id": str(uuid.uuid4()), "model": SEED_MODEL, "retailer": "Officeworks",
+            "retailer_url": "", "price_aud": 1729, "condition": "novo", "in_stock": False,
+            "logged_at": today - pd.Timedelta(days=2), "note": "exemplo — promoção",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
     ]
-    for padrao in padroes:
-        m = re.search(padrao, html, re.DOTALL)
-        if not m:
-            continue
-        try:
-            dados = json.loads(m.group(1))
-        except ValueError:
-            continue
-        preco = _procurar_preco_recursivo(
-            dados,
-            chaves=("price", "currentPrice", "sellingPrice", "salePrice", "value"),
-        )
-        if preco:
-            return preco
-    return None
+    return pd.DataFrame(rows, columns=COLUMNS)
 
 
-def extrair_preco_por_regex_simples(html):
+def load_data() -> pd.DataFrame:
+    """Carrega o histórico do CSV local; cria o arquivo com dados de
+    exemplo se ele ainda não existir."""
+    if DATA_FILE.exists():
+        df = pd.read_csv(DATA_FILE)
+    else:
+        df = _seed_dataframe()
+        save_data(df)
+
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    df["logged_at"] = pd.to_datetime(df["logged_at"], errors="coerce")
+    df["price_aud"] = pd.to_numeric(df["price_aud"], errors="coerce")
+    df["in_stock"] = df["in_stock"].fillna(True).astype(bool)
+    df["retailer_url"] = df["retailer_url"].fillna("")
+    df["note"] = df["note"].fillna("")
+    return df.dropna(subset=["model", "retailer", "price_aud", "logged_at"])
+
+
+def save_data(df: pd.DataFrame) -> None:
+    out = df.copy()
+    out["logged_at"] = pd.to_datetime(out["logged_at"]).dt.strftime("%Y-%m-%d")
+    out.to_csv(DATA_FILE, index=False, columns=COLUMNS)
+
+
+def add_entry(**fields) -> None:
+    df = st.session_state.df
+    new_row = {
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        **fields,
+    }
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    save_data(df)
+    st.session_state.df = load_data()
+
+
+def delete_entry(entry_id: str) -> None:
+    df = st.session_state.df
+    df = df[df["id"] != entry_id]
+    save_data(df)
+    st.session_state.df = load_data()
+
+
+def format_aud(value: float) -> str:
+    if pd.isna(value):
+        return "—"
+    if float(value).is_integer():
+        return f"$ {value:,.0f}"
+    return f"$ {value:,.2f}"
+
+
+# ----------------------------------------------------------------------------
+# Página
+# ----------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Rastreador MacBook AU",
+    page_icon="💻",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
     """
-    Método 3 (último recurso): procura qualquer coisa parecida com um
-    preço em dólar (ex.: $1,299.00) em qualquer lugar do HTML. Menos
-    confiável — pode pegar o valor errado se a página tiver vários
-    preços (frete, produtos relacionados, parcelamento etc.).
-    """
-    m = re.search(r"\$\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})", html)
-    return m.group(0) if m else None
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;500;600;700&display=swap');
 
+      html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
+      h1, h2, h3 { font-family: 'Fraunces', Georgia, serif !important; }
 
-# =================================================================
-# Funções principais — uma para cada loja
-# =================================================================
+      .hero-title { font-family:'Fraunces', Georgia, serif; font-weight:700; font-size:2.1rem; margin-bottom:0.1rem; }
+      .hero-sub { color:#6b7a75; font-size:0.98rem; max-width:70ch; margin-bottom:0.6rem; }
+      .private-note{
+        display:inline-flex; align-items:center; gap:7px; font-size:0.8rem; color:#6b7a75;
+        border:1px solid rgba(16,31,28,0.12); border-radius:999px; padding:4px 12px; margin-bottom:1.2rem;
+      }
+      .private-note .dot{ width:6px; height:6px; border-radius:50%; background:#0ca30c; }
 
-def buscar_preco_amazon(url):
-    nome_loja = "Amazon"
-    if not url or url.startswith("COLE_O_LINK"):
-        return f"⚠️  {nome_loja}: nenhum link foi colado ainda."
+      div[data-testid="stMetric"]{
+        background: rgba(42,120,214,0.06); border:1px solid rgba(16,31,28,0.08);
+        border-radius:14px; padding: 14px 16px 10px;
+      }
+      div[data-testid="stMetricLabel"] { font-size:0.8rem; color:#6b7a75; }
 
-    try:
-        resposta = requests.get(url, headers=HEADERS_AMAZON, timeout=15)
-        resposta.raise_for_status()
-    except Exception as erro:
-        return f"❌ {nome_loja}: não foi possível acessar a página ({erro})"
+      .stButton>button[kind="primary"]{ background-color:#2a78d6; border-color:#2a78d6; }
+      .stButton>button[kind="primary"]:hover{ background-color:#2266bb; border-color:#2266bb; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    html = resposta.text
-    soup = BeautifulSoup(html, "html.parser")
+if "df" not in st.session_state:
+    st.session_state.df = load_data()
 
-    # Seletores conhecidos da Amazon (mudam de tempos em tempos)
-    seletores = [
-        ("class", "a-price-whole"),
-        ("id", "priceblock_ourprice"),
-        ("id", "priceblock_dealprice"),
-        ("class", "a-offscreen"),
-    ]
-    for tipo, valor in seletores:
-        elemento = soup.find(id=valor) if tipo == "id" else soup.find(class_=valor)
-        if elemento and elemento.get_text(strip=True):
-            return f"✅ {nome_loja}: {elemento.get_text(strip=True)}"
+df = st.session_state.df
 
-    # Se não achou pelos seletores, tenta pelos dados estruturados
-    preco = extrair_de_json_ld(soup)
-    if preco:
-        return f"✅ {nome_loja} (dados estruturados): {preco}"
+st.markdown('<div class="hero-title">💻 Rastreador MacBook AU</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="hero-sub">Registre o preço do MacBook em cada loja que você conferir na Austrália, '
+    'acompanhe a variação ao longo do tempo e descubra a melhor hora e o melhor lugar para comprar — '
+    'para levar de presente pra sua mãe.</div>',
+    unsafe_allow_html=True,
+)
+st.markdown('<div class="private-note"><span class="dot"></span> Dados salvos localmente em macbook_prices.csv</div>', unsafe_allow_html=True)
 
-    if "captcha" in html.lower() or "robot check" in html.lower() or "api-services-support@amazon.com" in html.lower():
-        return (
-            f"🚫 {nome_loja}: a página devolveu uma verificação anti-robô. "
-            f"Não é um erro do código — é um bloqueio da própria Amazon."
-        )
-
-    return f"⚠️  {nome_loja}: preço não encontrado."
-
-
-def buscar_preco_generico(url, nome_loja):
-    """Usada para JB Hi-Fi e Officeworks: tenta os 3 métodos, em ordem."""
-    if not url or url.startswith("COLE_O_LINK"):
-        return f"⚠️  {nome_loja}: nenhum link foi colado ainda."
-
-    try:
-        resposta = requests.get(url, headers=HEADERS_PADRAO, timeout=15)
-        resposta.raise_for_status()
-    except Exception as erro:
-        return f"❌ {nome_loja}: não foi possível acessar a página ({erro})"
-
-    html = resposta.text
-    soup = BeautifulSoup(html, "html.parser")
-
-    preco = extrair_de_json_ld(soup)
-    if preco:
-        return f"✅ {nome_loja} (dados estruturados / JSON-LD): {preco}"
-
-    preco = extrair_de_estado_embutido(html)
-    if preco:
-        return f"✅ {nome_loja} (estado embutido no HTML): {preco}"
-
-    preco = extrair_preco_por_regex_simples(html)
-    if preco:
-        return f"✅ {nome_loja} (regex simples — confira se é o preço certo): {preco}"
-
-    return (
-        f"⚠️  {nome_loja}: preço não encontrado por nenhum dos 3 métodos. "
-        f"Provavelmente o preço só existe depois que o JavaScript roda no "
-        f"navegador — nesse caso só Selenium/Playwright resolveriam."
+if SEED_MODEL in df["model"].unique():
+    st.info(
+        "As linhas com **Exemplo** no nome são só demonstração. Use \"Remover um registro\" "
+        "na barra lateral para apagá-las e comece a registrar os preços reais que você encontrar.",
+        icon="💡",
     )
 
+# ---------------------------------------------------------------- sidebar ---
 
-# ---------------------------------------------------------------
-# Executa a busca e mostra o resultado de cada loja
-# ---------------------------------------------------------------
-print(buscar_preco_amazon(LINK_AMAZON))
-print(buscar_preco_generico(LINK_JBHIFI, "JB Hi-Fi"))
-print(buscar_preco_generico(LINK_OFFICEWORKS, "Officeworks"))
+with st.sidebar:
+    st.header("Registrar novo preço")
+
+    with st.form("add_form", clear_on_submit=True):
+        existing_models = sorted(m for m in df["model"].unique() if not m.startswith("Exemplo"))
+        model_options = existing_models + [m for m in COMMON_MODELS if m not in existing_models]
+
+        model_choice = st.selectbox("Modelo", options=["— selecione —"] + model_options)
+        model_custom = st.text_input("Ou digite um modelo novo", placeholder='ex.: MacBook Pro 16" M4 Max (36GB/1TB)')
+
+        existing_retailers = sorted(df["retailer"].unique())
+        retailer_options = existing_retailers + [r for r in COMMON_RETAILERS if r not in existing_retailers]
+        retailer_choice = st.selectbox("Loja", options=["— selecione —"] + retailer_options)
+        retailer_custom = st.text_input("Ou digite outra loja")
+
+        price = st.number_input("Preço (AUD)", min_value=0, step=10, value=0)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            condition = st.radio("Condição", options=["novo", "recondicionado"], format_func=lambda v: "Novo" if v == "novo" else "Recondicionado")
+        with col_b:
+            in_stock = st.checkbox("Em estoque", value=True)
+        logged_at = st.date_input("Data", value=date.today())
+        retailer_url = st.text_input("Link do produto (opcional)")
+        note = st.text_input("Nota (opcional)", placeholder="ex.: cupom de 10%, Black Friday...")
+
+        submitted = st.form_submit_button("Salvar preço", type="primary", use_container_width=True)
+
+        if submitted:
+            final_model = model_custom.strip() or (model_choice if model_choice != "— selecione —" else "")
+            final_retailer = retailer_custom.strip() or (retailer_choice if retailer_choice != "— selecione —" else "")
+            if not final_model or not final_retailer or price <= 0:
+                st.error("Preencha ao menos modelo, loja e um preço maior que zero.")
+            else:
+                add_entry(
+                    model=final_model, retailer=final_retailer, retailer_url=retailer_url.strip(),
+                    price_aud=price, condition=condition, in_stock=in_stock,
+                    logged_at=logged_at, note=note.strip(),
+                )
+                st.success("Preço salvo!")
+                st.rerun()
+
+    st.divider()
+    st.subheader("Remover um registro")
+    if df.empty:
+        st.caption("Nenhum registro ainda.")
+    else:
+        df_sorted = df.sort_values("logged_at", ascending=False)
+        labels = {
+            row.id: f'{row.logged_at.strftime("%d/%m/%Y")} · {row.retailer} · {format_aud(row.price_aud)} — {row.model}'
+            for row in df_sorted.itertuples()
+        }
+        to_remove = st.selectbox("Selecione o registro", options=list(labels.keys()), format_func=lambda i: labels[i])
+        if st.button("Excluir registro selecionado", use_container_width=True):
+            delete_entry(to_remove)
+            st.success("Registro removido.")
+            st.rerun()
+
+# ----------------------------------------------------------------- main -----
+
+if df.empty:
+    st.warning("Nenhum preço registrado ainda. Use o formulário na barra lateral para começar.")
+    st.stop()
+
+models = sorted(df["model"].unique(), key=lambda m: (m.startswith("Exemplo"), m))
+selected_model = st.radio("Modelo", options=models, horizontal=True, label_visibility="collapsed")
+
+filtered = df[df["model"] == selected_model].sort_values("logged_at")
+
+# --- KPIs ---
+cheapest = filtered.loc[filtered["price_aud"].idxmin()]
+latest = filtered.iloc[-1]
+first = filtered.iloc[0]
+savings = max(0.0, first["price_aud"] - cheapest["price_aud"])
+n_stores = filtered["retailer"].nunique()
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Menor preço encontrado", format_aud(cheapest["price_aud"]), f'{cheapest["retailer"]} · {cheapest["logged_at"].strftime("%d/%m")}')
+k2.metric("Preço mais recente", format_aud(latest["price_aud"]), f'{latest["retailer"]} · {latest["logged_at"].strftime("%d/%m")}')
+k3.metric("Economia encontrada", format_aud(savings) if savings > 0 else "—", "vs. primeiro preço registrado" if savings > 0 else "sem variação ainda")
+k4.metric("Lojas comparadas", n_stores, ", ".join(sorted(filtered["retailer"].unique())[:3]))
+
+st.markdown("### Preços atuais")
+st.caption("Preço mais recente registrado em cada loja para este modelo.")
+
+current = (
+    filtered.sort_values("logged_at")
+    .groupby("retailer", as_index=False)
+    .last()
+    .sort_values("price_aud")
+)
+current_display = current[["retailer", "price_aud", "condition", "in_stock", "logged_at", "retailer_url", "note"]].rename(
+    columns={
+        "retailer": "Loja", "price_aud": "Preço", "condition": "Condição",
+        "in_stock": "Em estoque", "logged_at": "Atualizado em", "retailer_url": "Link", "note": "Nota",
+    }
+)
+current_display["Condição"] = current_display["Condição"].map({"novo": "Novo", "recondicionado": "Recondicionado"}).fillna(current_display["Condição"])
+
+st.dataframe(
+    current_display,
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "Preço": st.column_config.NumberColumn("Preço (AUD)", format="$ %.0f"),
+        "Atualizado em": st.column_config.DateColumn("Atualizado em", format="DD/MM/YYYY"),
+        "Em estoque": st.column_config.CheckboxColumn("Em estoque"),
+        "Link": st.column_config.LinkColumn("Link", display_text="abrir ↗"),
+    },
+)
+
+st.markdown("### Histórico de preços")
+st.caption("Cada ponto é um preço registrado; o marcador em destaque mostra o menor preço encontrado.")
+
+fig = go.Figure()
+for i, (retailer, group) in enumerate(filtered.groupby("retailer")):
+    group = group.sort_values("logged_at")
+    color = LINE_COLORS[i % len(LINE_COLORS)]
+    fig.add_trace(
+        go.Scatter(
+            x=group["logged_at"], y=group["price_aud"], mode="lines+markers", name=retailer,
+            line=dict(width=2, color=color), marker=dict(size=8, color=color, line=dict(width=2, color="#ffffff")),
+            hovertemplate="<b>%{fullData.name}</b><br>%{x|%d/%m/%Y}<br>$ %{y:,.0f}<extra></extra>",
+        )
+    )
+
+fig.add_trace(
+    go.Scatter(
+        x=[cheapest["logged_at"]], y=[cheapest["price_aud"]], mode="markers", name="Menor preço",
+        marker=dict(size=16, color="rgba(0,0,0,0)", line=dict(width=2, color=GOOD)),
+        hoverinfo="skip", showlegend=False,
+    )
+)
+
+fig.update_layout(
+    template="plotly_white",
+    height=420,
+    margin=dict(l=10, r=10, t=10, b=10),
+    hovermode="closest",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    xaxis=dict(title="Data", showgrid=False),
+    yaxis=dict(title="Preço (AUD)", tickprefix="$ ", gridcolor="rgba(16,31,28,0.08)"),
+    font=dict(family="Inter, sans-serif", color="#101f1c"),
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+with st.expander("Ver histórico completo (todas as lojas e datas)"):
+    history_display = filtered.sort_values("logged_at", ascending=False)[
+        ["logged_at", "retailer", "price_aud", "condition", "in_stock", "note"]
+    ].rename(columns={
+        "logged_at": "Data", "retailer": "Loja", "price_aud": "Preço",
+        "condition": "Condição", "in_stock": "Em estoque", "note": "Nota",
+    })
+    history_display["Condição"] = history_display["Condição"].map({"novo": "Novo", "recondicionado": "Recondicionado"}).fillna(history_display["Condição"])
+    st.dataframe(
+        history_display, hide_index=True, use_container_width=True,
+        column_config={
+            "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+            "Preço": st.column_config.NumberColumn("Preço (AUD)", format="$ %.0f"),
+            "Em estoque": st.column_config.CheckboxColumn("Em estoque"),
+        },
+    )
+
+st.caption("Rastreador MacBook AU · dados salvos em " + DATA_FILE.name)
